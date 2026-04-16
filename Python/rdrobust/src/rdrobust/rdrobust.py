@@ -599,8 +599,8 @@ def rdrobust(y, x, c = None, fuzzy = None, deriv = None,
         s_Y = (np.hstack([1,-gamma_p[:,0]])).reshape(-1,1)
         
         if fuzzy is None:
-            tau_cl = float(np.matmul(scalepar*s_Y.T,beta_p[deriv,:]))
-            tau_bc = float(np.matmul(scalepar*s_Y.T,beta_bc[deriv,:]))
+            tau_cl = np.matmul(scalepar*s_Y.T,beta_p[deriv,:]).item()
+            tau_bc = np.matmul(scalepar*s_Y.T,beta_bc[deriv,:]).item()
             tau_Y_cl_l = np.matmul(scalepar*s_Y.T,beta_p_l[deriv,:])
             tau_Y_cl_r = np.matmul(scalepar*s_Y.T,beta_p_r[deriv,:])
             tau_Y_bc_l = np.matmul(scalepar*s_Y.T,beta_bc_l[deriv,:])
