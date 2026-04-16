@@ -10,6 +10,8 @@ Created on Sat Jun  5 14:07:58 2021
 
 import numpy as np
 import math
+
+from numba import njit
 from scipy.linalg import qr
 
 class rdrobust_output:
@@ -265,10 +267,10 @@ def qrXXinv(x):
 def complete_cases(x):
     return np.all(np.invert(np.isnan(x)), axis = 1)
 
-def covs_drop_fun(z,tol = 1e-5):
-    q,r,pivot = qr(a = z, pivoting = True)
-    keep = pivot[np.abs(np.diagonal(r))>tol]
-    return z[:,keep]
+def covs_drop_fun(z, tol=1e-5):
+    r, pivot = qr(z, pivoting=True, mode='r')
+    keep = pivot[np.abs(np.diagonal(r)) > tol]
+    return z[:, keep]
     
 def rdrobust_kweight(X, c, h, kernel):
     
@@ -281,98 +283,282 @@ def rdrobust_kweight(X, c, h, kernel):
         w = ((1-abs(u))*(abs(u)<=1))/h
     return w
 
+@njit(cache=True)
+def _nn_bounds(
+    X: np.ndarray,
+    dups: np.ndarray,
+    dupsid: np.ndarray,
+    matches: int,
+    n: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the left/right NN window boundaries for each observation.
+
+    For each position, expands a window around it until at least ``matches``
+    neighbours are included, respecting duplicate structure encoded in
+    ``dups``/``dupsid``. The logic mirrors the original rdrobust_res exactly,
+    but runs as compiled machine code via numba.
+
+    Parameters
+    ----------
+    X : (n,) float64
+        Running variable, must be sorted.
+    dups : (n,) int64
+        Number of observations sharing the same X value.
+    dupsid : (n,) int64
+        Within-group cumulative index (1-based).
+    matches : int
+        Minimum number of neighbours (``nnmatch``).
+    n : int
+        Length of the arrays.
+
+    Returns
+    -------
+    lo, hi : (n,) int64
+        Inclusive index bounds of each observation's neighbour window.
+    """
+    lo = np.empty(n, dtype=np.int64)
+    hi = np.empty(n, dtype=np.int64)
+    m = min(matches, n - 1)
+    for pos in range(n):
+        rpos = dups[pos] - dupsid[pos]
+        lpos = dupsid[pos] - 1
+        while lpos + rpos < m:
+            if pos - lpos - 1 < 0:
+                rpos += dups[pos + rpos + 1]
+            elif pos + rpos + 1 >= n:
+                lpos += dups[pos - lpos - 1]
+            elif X[pos] - X[pos - lpos - 1] > X[pos + rpos + 1] - X[pos]:
+                rpos += dups[pos + rpos + 1]
+            elif X[pos] - X[pos - lpos - 1] < X[pos + rpos + 1] - X[pos]:
+                lpos += dups[pos - lpos - 1]
+            else:
+                rpos += dups[pos + rpos + 1]
+                lpos += dups[pos - lpos - 1]
+        left = pos - lpos
+        right = pos + rpos
+        lo[pos] = left if left > 0 else 0
+        hi[pos] = right if right < n - 1 else n - 1
+    return lo, hi
+
+
 def rdrobust_res(X, y, T, Z, m, hii, vce, matches, dups, dupsid, d):
-    
+    """Compute residuals for rdrobust variance estimation.
+
+    Drop-in replacement for ``rdrobust.funs.rdrobust_res``. The NN path is
+    accelerated via numba + cumsum vectorisation; the HC path is unchanged.
+
+    Parameters
+    ----------
+    X : (n,) array
+        Running variable (sorted).
+    y : (n,) array
+        Outcome variable.
+    T : (n,) array or None
+        Treatment variable (fuzzy designs).
+    Z : (n, dZ) array or None
+        Covariate matrix.
+    m : (n, 1+dT+dZ) array or scalar
+        Predicted values (HC path only).
+    hii : (n, 1) array or scalar
+        Hat matrix diagonal (HC2/HC3 only).
+    vce : str
+        Variance estimator type: "nn", "hc0", "hc1", "hc2", or "hc3".
+    matches : int
+        Minimum number of NN matches.
+    dups, dupsid : (n,) int arrays
+        Duplicate structure of X (NN path only).
+    d : int
+        Number of estimated parameters (HC1 degrees-of-freedom correction).
+
+    Returns
+    -------
+    res : (n, 1+dT+dZ) array
+        Residual matrix.
+    """
     n = len(y)
-    dT = dZ =  0
-    if T is not None:
-        dT = 1
-    if Z is not None:
-        dZ = ncol(Z)  
-    res = nanmat(n,1+dT+dZ)
-    if vce=="nn":
-        for pos in range(n):
-            rpos = dups[pos] - dupsid[pos]
-            lpos = dupsid[pos] - 1
-            while lpos+rpos < min(matches,n-1):
-              if pos-lpos-1 < 0:
-                  rpos += dups[pos+rpos+1]
-              elif pos+rpos+1 >= n:
-                  lpos += dups[pos-lpos-1]
-              elif (X[pos]-X[pos-lpos-1]) > (X[pos+rpos+1]-X[pos]): 
-                  rpos += dups[pos+rpos+1]
-              elif (X[pos]-X[pos-lpos-1]) < (X[pos+rpos+1]-X[pos]):
-                  lpos += dups[pos-lpos-1]
-              else:
-                  rpos += dups[pos+rpos+1]
-                  lpos += dups[pos-lpos-1]
-            ind_J = np.arange(max(0,pos-lpos), min(n,pos+rpos)+1)
-            y_J   = sum(y[ind_J])-y[pos]
-            Ji = len(ind_J)-1
-            res[pos,0] = np.sqrt(Ji/(Ji+1))*(y[pos] - y_J/Ji)
-            if T is not None:
-                T_J = sum(T[ind_J])-T[pos]
-                res[pos,1] = np.sqrt(Ji/(Ji+1))*(T[pos] - T_J/Ji)
-            if Z is not None:
-                for i in range(dZ):
-                    Z_J = sum(Z[ind_J,i])-Z[pos,i]
-                    res[pos,1+dT+i] = np.sqrt(Ji/(Ji+1))*(Z[pos,i] - Z_J/Ji)	
-    else:
-        
-        if vce=="hc0": w = 1
-        elif vce=="hc1": w = np.sqrt(n/(n-d))
-        elif vce=="hc2":
-            hii = hii.reshape(-1)
-            w = np.sqrt(1/(1-hii))
+    dT = int(T is not None)
+    dZ = ncol(Z) if Z is not None else 0
+
+    if vce != "nn":
+        res = nanmat(n, 1 + dT + dZ)
+        if vce == "hc0":
+            w = 1
+        elif vce == "hc1":
+            w = np.sqrt(n / (n - d))
+        elif vce == "hc2":
+            w = np.sqrt(1.0 / (1.0 - hii.ravel()))
         else:
-            hii = hii.reshape(-1)
-            w = 1/(1-hii)
-        m = m.reshape(-1,ncol(m))
-        res[:,0] = w*(y-m[:,0])
-        if dT==1: res[:,1] = w*(T-m[:,1])
-        if dZ>0:
-           for i in range(dZ):
-               res[:,1+dT+i] = w*(Z[:,i]- m[:,1+dT+i])
-               
-    return res
+            w = 1.0 / (1.0 - hii.ravel())
+        m = m.reshape(-1, ncol(m))
+        res[:, 0] = w * (y - m[:, 0])
+        if dT:
+            res[:, 1] = w * (T - m[:, 1])
+        for i in range(dZ):
+            res[:, 1 + dT + i] = w * (Z[:, i] - m[:, 1 + dT + i])
+        return res
+
+    # ── NN path ─────────────────────────────────────────────────────
+
+    # Step 1: compute window boundaries via numba-jitted loop.
+    lo, hi = _nn_bounds(X, dups, dupsid, matches, n)
+
+    # Step 2: stack all variables into one matrix and compute window
+    # sums via cumsum.  For window [lo[i], hi[i]], the sum is
+    # cumD[hi[i]] - cumD[lo[i]-1], with cumD[-1] = 0 by convention.
+    cols = [y]
+    if T is not None:
+        cols.append(T)
+    if Z is not None:
+        cols.extend(Z[:, i] for i in range(dZ))
+    D = np.column_stack(cols)  # (n, 1+dT+dZ)
+
+    cumD = np.cumsum(D, axis=0)  # (n, 1+dT+dZ)
+    window_sum = cumD[hi]
+    mask = lo > 0
+    window_sum[mask] -= cumD[lo[mask] - 1]
+
+    neighbour_sum = window_sum - D
+    Ji = (hi - lo).astype(np.float64)  # window_size - 1
+    scale = np.sqrt(Ji / (Ji + 1.0))
+
+    return scale[:, None] * (D - neighbour_sum / Ji[:, None])
+
+# def rdrobust_res(X, y, T, Z, m, hii, vce, matches, dups, dupsid, d):
+#
+#     n = len(y)
+#     dT = dZ =  0
+#     if T is not None:
+#         dT = 1
+#     if Z is not None:
+#         dZ = ncol(Z)
+#     res = nanmat(n,1+dT+dZ)
+#     if vce=="nn":
+#         for pos in range(n):
+#             rpos = dups[pos] - dupsid[pos]
+#             lpos = dupsid[pos] - 1
+#             while lpos+rpos < min(matches,n-1):
+#               if pos-lpos-1 < 0:
+#                   rpos += dups[pos+rpos+1]
+#               elif pos+rpos+1 >= n:
+#                   lpos += dups[pos-lpos-1]
+#               elif (X[pos]-X[pos-lpos-1]) > (X[pos+rpos+1]-X[pos]):
+#                   rpos += dups[pos+rpos+1]
+#               elif (X[pos]-X[pos-lpos-1]) < (X[pos+rpos+1]-X[pos]):
+#                   lpos += dups[pos-lpos-1]
+#               else:
+#                   rpos += dups[pos+rpos+1]
+#                   lpos += dups[pos-lpos-1]
+#             ind_J = np.arange(max(0,pos-lpos), min(n,pos+rpos)+1)
+#             y_J   = sum(y[ind_J])-y[pos]
+#             Ji = len(ind_J)-1
+#             res[pos,0] = np.sqrt(Ji/(Ji+1))*(y[pos] - y_J/Ji)
+#             if T is not None:
+#                 T_J = sum(T[ind_J])-T[pos]
+#                 res[pos,1] = np.sqrt(Ji/(Ji+1))*(T[pos] - T_J/Ji)
+#             if Z is not None:
+#                 for i in range(dZ):
+#                     Z_J = sum(Z[ind_J,i])-Z[pos,i]
+#                     res[pos,1+dT+i] = np.sqrt(Ji/(Ji+1))*(Z[pos,i] - Z_J/Ji)
+#     else:
+#
+#         if vce=="hc0": w = 1
+#         elif vce=="hc1": w = np.sqrt(n/(n-d))
+#         elif vce=="hc2":
+#             hii = hii.reshape(-1)
+#             w = np.sqrt(1/(1-hii))
+#         else:
+#             hii = hii.reshape(-1)
+#             w = 1/(1-hii)
+#         m = m.reshape(-1,ncol(m))
+#         res[:,0] = w*(y-m[:,0])
+#         if dT==1: res[:,1] = w*(T-m[:,1])
+#         if dZ>0:
+#            for i in range(dZ):
+#                res[:,1+dT+i] = w*(Z[:,i]- m[:,1+dT+i])
+#
+#     return res
+
+# def rdrobust_vce(d, s, RX, res, C):
+#     k = ncol(RX)
+#     M = np.zeros((k,k))
+#     if C is None:
+#         w = 1
+#         if d==0:
+#             M  = crossprod(res*RX,res*RX)
+#         else:
+#             for i in range(d+1):
+#                 SS = (res[:,i].reshape(-1,1))*res
+#                 for j in range(d+1):
+#                     M += crossprod(RX*(s[i]*s[j])*SS[:,j].reshape(-1,1),RX)
+#     else:
+#         try: n = len(C)
+#         except: n = 1
+#         clusters = np.unique(C)
+#         g = len(clusters)
+#         w = ((n-1)/(n-k))*(g/(g-1))
+#         if d==0:
+#             for i in range(g):
+#                 ind = C==clusters[i]
+#                 Xi = RX[ind,:]
+#                 ri = res[ind,:]
+#                 Xr = crossprod(Xi,ri).T
+#                 M = M + crossprod(Xr,Xr)
+#         else:
+#             for i in range(g):
+#                 ind = (C==clusters[i])
+#                 Xi = RX[ind,:]
+#                 ri = res[ind,:]
+#                 MHolder = np.zeros((1+d,k))
+#                 for l in range(d+1):
+#                     MHolder[l,:] = crossprod(Xi,s[l]*ri[:,l]).T
+#                 summedvalues = np.sum(MHolder, axis = 0)
+#                 M = M + np.outer(summedvalues,summedvalues)
+#
+#     return w*M
 
 def rdrobust_vce(d, s, RX, res, C):
     k = ncol(RX)
-    M = np.zeros((k,k))
+
     if C is None:
-        w = 1
-        if d==0:
-            M  = crossprod(res*RX,res*RX)
+        if d == 0:
+            A = RX * res
+            M = A.T @ A
         else:
-            for i in range(d+1):
-                SS = (res[:,i].reshape(-1,1))*res
-                for j in range(d+1):
-                    M += crossprod(RX*(s[i]*s[j])*SS[:,j].reshape(-1,1),RX)
+            s_flat = np.asarray(s).ravel()
+            e = res @ s_flat  # (n,)
+            A = RX * e[:, None]  # (n, k)
+            M = A.T @ A
+        return M
+
+    # ── Cluster branch ──────────────────────────────────────────────────
+    try:
+        n = len(C)
+    except TypeError:
+        n = 1
+
+    C_flat = C.ravel()
+
+    if d == 0:
+        A = RX * res  # (n, k)
     else:
-        try: n = len(C)
-        except: n = 1
-        clusters = np.unique(C)
-        g = len(clusters)
-        w = ((n-1)/(n-k))*(g/(g-1))
-        if d==0:
-            for i in range(g):
-                ind = C==clusters[i]
-                Xi = RX[ind,:]
-                ri = res[ind,:]
-                Xr = crossprod(Xi,ri).T
-                M = M + crossprod(Xr,Xr)
-        else:
-            for i in range(g):
-                ind = (C==clusters[i])
-                Xi = RX[ind,:]
-                ri = res[ind,:]
-                MHolder = np.zeros((1+d,k))
-                for l in range(d+1):
-                    MHolder[l,:] = crossprod(Xi,s[l]*ri[:,l]).T
-                summedvalues = np.sum(MHolder, axis = 0)
-                M = M + np.outer(summedvalues,summedvalues)
-                    
-    return w*M	 
+        s_flat = np.asarray(s).ravel()
+        e = res @ s_flat
+        A = RX * e[:, None]
+
+    # Map cluster IDs to dense 0..g-1 labels. np.unique returns sorted
+    # unique values and an inverse index — this is one pass over C.
+    _, inverse = np.unique(C_flat, return_inverse=True)
+    g = int(inverse.max()) + 1
+    w = ((n - 1) / (n - k)) * (g / (g - 1))
+
+    # bincount is much faster than add.at or sort+reduceat for small k,
+    # since it's a single optimised C loop per column.
+    cluster_sums = np.column_stack(
+        [np.bincount(inverse, weights=A[:, j], minlength=g) for j in range(k)]
+    )  # (g, k)
+
+    M = cluster_sums.T @ cluster_sums
+    return w * M
 
 def rdrobust_bw(Y, X, T, Z, C, W, c, o, nu, o_B, h_V, h_B, scale, 
                  vce, nnmatch, kernel, dups, dupsid, covs_drop_coll):
@@ -455,7 +641,7 @@ def rdrobust_bw(Y, X, T, Z, C, W, c, o, nu, o_B, h_V, h_B, scale,
     w = rdrobust_kweight(X, c, h_B, kernel)
     if not np.isscalar(W): w = W*w
     ind = w> 0 
-    n_B = sum(ind)
+    n_B = np.sum(ind)
     eY = Y[ind]
     eX = X[ind]
     eW = w[ind]
